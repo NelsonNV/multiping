@@ -1,0 +1,20 @@
+{
+  "google": {
+      "dns": "google.cl",
+      "ip": "8.8.8.8",
+      "alt_ips": ["8.8.4.4"],
+      "port": 443
+  },
+  "cloudflare": {
+      "dns": "one.one.one.one",
+      "ip": "1.1.1.1",
+      "alt_ips": ["1.0.0.1"],
+      "port": 80
+  },
+  "myserver": {
+      "ip": "127.0.0.1",
+      "alt_ips": ["192.168.1.1", "192.168.1.2"],
+      "dns":"navarrolabs.cl:443",
+      "port": 80
+  }
+}
