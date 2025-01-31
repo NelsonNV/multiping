@@ -1,12 +1,20 @@
-
-use std::{fs, collections::BTreeMap, sync::Arc, net::IpAddr, io::Write};
-use serde::Deserialize;
-use tokio::{task, time, sync::Mutex, net::lookup_host};
-use crossterm::{execute, terminal::{Clear, ClearType}, cursor::MoveTo};
-use std::io::{stdout, BufWriter};
-use futures::future::join_all;
-use surge_ping::{Client, Config, PingIdentifier, PingSequence};
 use chrono::Local;
+use crossterm::{
+    cursor::MoveTo,
+    execute,
+    terminal::{Clear, ClearType},
+};
+use futures::future::join_all;
+use serde::Deserialize;
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{stdout, BufWriter, Write},
+    net::IpAddr,
+    sync::Arc,
+};
+use surge_ping::{Client, Config, PingIdentifier, PingSequence};
+use tokio::{net::lookup_host, sync::Mutex, time};
 
 #[derive(Deserialize, Clone)]
 struct HostConfig {
@@ -23,122 +31,212 @@ struct IPs(BTreeMap<String, HostConfig>);
 async fn main() {
     let mut stdout = stdout();
     execute!(stdout, Clear(ClearType::All)).unwrap();
-
-    let data = fs::read_to_string("ips.json").expect("No se pudo leer el archivo JSON");
-    let ips: IPs = serde_json::from_str(&data).expect("Error al parsear el JSON");
-
-    let mut request_count = 0;
+    let ips = load_ips("ips.json");
+    let log_filename = create_log_file();
     let total_packet_loss = Arc::new(Mutex::new(0));
-
-    let start_time = Local::now().format("%d-%m-%Y_%H-%M-%S").to_string();
-    let log_filename = format!("log_{}.csv", start_time);
-    let mut log_file = BufWriter::new(fs::File::create(&log_filename).expect("Error creando log"));
-
-    writeln!(log_file, "timestamp,host,tipo,direccion,latencia,port,pkt,estado").expect("Error escribiendo en el archivo log");
-    log_file.flush().expect("Error al guardar log");
+    let mut request_count = 0;
 
     loop {
         request_count += 1;
-        let mut tasks = vec![];
-
-        for (host, config) in ips.0.clone() {
-            let total_loss_clone = Arc::clone(&total_packet_loss);
-            let log_filename_clone = log_filename.clone();
-
-            let parsed_ip = parse_ip_and_port(&config.ip, config.port);
-            let port = parsed_ip.1;
-
-            tasks.push(tokio::spawn(check_ping(
-                host.clone(), "IP".to_string(), parsed_ip.0.clone(), port, total_loss_clone.clone(), log_filename_clone.clone()
-            )));
-
-            if let Some(dns) = config.dns.clone() {
-                let parsed_dns = parse_ip_and_port(&dns, config.port);
-                tasks.push(tokio::spawn(check_ping(
-                    host.clone(), "DNS".to_string(), parsed_dns.0, parsed_dns.1, total_loss_clone.clone(), log_filename_clone.clone()
-                )));
-            }
-
-            if let Some(alt_ips) = config.alt_ips.clone() {
-                for alt_ip in alt_ips {
-                    let parsed_alt_ip = parse_ip_and_port(&alt_ip, config.port);
-                    tasks.push(tokio::spawn(check_ping(
-                        host.clone(), "Alt IP".to_string(), parsed_alt_ip.0, parsed_alt_ip.1, total_loss_clone.clone(), log_filename_clone.clone()
-                    )));
-                }
-            }
-        }
-
-        let results = join_all(tasks).await;
-        let mut output_table: Vec<(String, String, String, String, String, String, String)> = vec![];
-
-        for result in results {
-            if let Ok(res) = result {
-                output_table.push(res);
-            }
-        }
-
-        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0)).unwrap();
-        println!("Peticiones realizadas: {} | Paquetes perdidos globalmente: {}\n", request_count, *total_packet_loss.lock().await);
-
-        println!("{:<15} | {:<10} | {:<20} | {:<8} | {:<6} | {:<3} | {:<10}", "Host", "Tipo", "Dirección", "Latencia", "Port", "Pkt", "Estado");
-        println!("{}", "-".repeat(89));
-
-        for row in output_table {
-            println!("{:<15} | {:<10} | {:<20} | {:<8} | {:<6} | {:<3} | {:<10}", row.0, row.1, row.2, row.3, row.4, row.5, row.6);
-        }
-        stdout.flush().unwrap();
-
+        let results = perform_checks(&ips, &log_filename, &total_packet_loss).await;
+        display_results(&mut stdout, request_count, &total_packet_loss, &results).await;
         time::sleep(time::Duration::from_millis(500)).await;
     }
 }
 
-async fn check_ping(host: String, tipo: String, direccion: String, port: Option<u16>, total_loss: Arc<Mutex<u32>>, log_filename: String) -> (String, String, String, String, String, String, String) {
+fn load_ips(filename: &str) -> IPs {
+    let data = fs::read_to_string(filename).expect("No se pudo leer el archivo JSON");
+    serde_json::from_str(&data).expect("Error al parsear el JSON")
+}
+
+fn create_log_file() -> String {
+    let filename = format!("log_{}.csv", Local::now().format("%d-%m-%Y_%H-%M-%S"));
+    let mut log_file = BufWriter::new(fs::File::create(&filename).expect("Error creando log"));
+    writeln!(
+        log_file,
+        "timestamp,host,tipo,direccion,latencia,port,pkt,estado"
+    )
+    .unwrap();
+    log_file.flush().unwrap();
+    filename
+}
+
+async fn perform_checks(
+    ips: &IPs,
+    log_filename: &str,
+    total_packet_loss: &Arc<Mutex<u32>>,
+) -> Vec<(String, String, String, String, String, String, String)> {
+    let mut tasks = vec![];
+    for (host, config) in &ips.0 {
+        let total_loss_clone = Arc::clone(total_packet_loss);
+        let log_filename_clone = log_filename.to_string();
+        add_ping_tasks(
+            host,
+            config,
+            &mut tasks,
+            total_loss_clone,
+            log_filename_clone,
+        );
+    }
+    join_all(tasks)
+        .await
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect()
+}
+
+fn add_ping_tasks(
+    host: &String,
+    config: &HostConfig,
+    tasks: &mut Vec<
+        tokio::task::JoinHandle<(String, String, String, String, String, String, String)>,
+    >,
+    total_loss_clone: Arc<Mutex<u32>>,
+    log_filename_clone: String,
+) {
+    let parsed_ip = parse_ip_and_port(&config.ip, config.port);
+    tasks.push(tokio::spawn(check_ping(
+        host.clone(),
+        "IP".to_string(),
+        parsed_ip.0,
+        parsed_ip.1,
+        total_loss_clone.clone(),
+        log_filename_clone.clone(),
+    )));
+    if let Some(dns) = &config.dns {
+        let parsed_dns = parse_ip_and_port(dns, config.port);
+        tasks.push(tokio::spawn(check_ping(
+            host.clone(),
+            "DNS".to_string(),
+            parsed_dns.0,
+            parsed_dns.1,
+            total_loss_clone.clone(),
+            log_filename_clone.clone(),
+        )));
+    }
+    if let Some(alt_ips) = &config.alt_ips {
+        for alt_ip in alt_ips {
+            let parsed_alt_ip = parse_ip_and_port(alt_ip, config.port);
+            tasks.push(tokio::spawn(check_ping(
+                host.clone(),
+                "Alt IP".to_string(),
+                parsed_alt_ip.0,
+                parsed_alt_ip.1,
+                total_loss_clone.clone(),
+                log_filename_clone.clone(),
+            )));
+        }
+    }
+}
+
+async fn display_results(
+    stdout: &mut std::io::Stdout,
+    request_count: u32,
+    total_packet_loss: &Arc<Mutex<u32>>,
+    results: &[(String, String, String, String, String, String, String)],
+) {
+    execute!(stdout, Clear(ClearType::All), MoveTo(0, 0)).unwrap();
+    println!(
+        "Peticiones realizadas: {} | Paquetes perdidos globalmente: {}\n",
+        request_count,
+        *total_packet_loss.lock().await
+    );
+    println!(
+        "{:<15} | {:<10} | {:<20} | {:<8} | {:<6} | {:<3} | {:<10}",
+        "Host", "Tipo", "Dirección", "Latencia", "Port", "Pkt", "Estado"
+    );
+    println!("{}", "-".repeat(89));
+    for row in results {
+        println!(
+            "{:<15} | {:<10} | {:<20} | {:<8} | {:<6} | {:<3} | {:<10}",
+            row.0, row.1, row.2, row.3, row.4, row.5, row.6
+        );
+    }
+    stdout.flush().unwrap();
+}
+
+async fn check_ping(
+    host: String,
+    tipo: String,
+    direccion: String,
+    port: Option<u16>,
+    total_loss: Arc<Mutex<u32>>,
+    log_filename: String,
+) -> (String, String, String, String, String, String, String) {
+
     let addr = match resolve_hostname(&direccion).await {
         Some(ip) => ip,
-        None => return (host, tipo, direccion, "N/A".to_string(), port.unwrap_or(0).to_string(), "-".to_string(), "🔴".to_string()),
+        None => {
+            return (
+                host,
+                tipo,
+                direccion,
+                "N/A".to_string(),
+                port.unwrap_or(0).to_string(),
+                "-".to_string(),
+                "🔴".to_string(),
+            );
+        }
     };
 
-    let client = Client::new(&Config::default()).expect("Error al crear cliente ICMP");
-
+    let client = Client::new(&Config::default()).unwrap();
     let mut pinger = client.pinger(addr, PingIdentifier(0)).await;
+    let (losses, total_time) = ping_loop(&mut pinger).await;
+    let avg_ping = calculate_avg_ping(losses, total_time);
+    let status_icon = determine_status_icon(losses);
+    *total_loss.lock().await += losses;
+    log_ping_result(
+        &log_filename,
+        &host,
+        &tipo,
+        &direccion,
+        &avg_ping,
+        port,
+        losses,
+        &status_icon,
+    );
+    (
+        host,
+        tipo,
+        direccion,
+        avg_ping,
+        port.unwrap_or(0).to_string(),
+        losses.to_string(),
+        status_icon,
+    )
+}
+
+async fn ping_loop(pinger: &mut surge_ping::Pinger) -> (u32, f64) {
     let mut losses = 0;
     let mut total_time = 0.0;
-    let count = 2;
-
-    for i in 0..count {
-        let seq = PingSequence(i as u16);
-        match pinger.ping(seq, &[0]).await {
-            Ok((_, rtt)) => {
-                total_time += rtt.as_millis() as f64;
-            }
-            Err(_) => {
-                losses += 1;
-            }
+    for i in 0..2 {
+        if let Ok((_, rtt)) = pinger.ping(PingSequence(i as u16), &[0]).await {
+            total_time += rtt.as_millis() as f64;
+        } else {
+            losses += 1;
         }
         time::sleep(time::Duration::from_millis(50)).await;
     }
+    (losses, total_time)
+}
 
-    let avg_ping = if count - losses > 0 {
-        format!("{:.1}ms", total_time / ((count - losses) as f64))
+fn calculate_avg_ping(losses: u32, total_time: f64) -> String {
+    if losses < 2 {
+        format!("{:.1}ms", total_time / (2 - losses) as f64)
     } else {
         "N/A".to_string()
-    };
+    }
+}
 
-    let status_icon = match losses {
-        0 => "🟢".to_string(),
-        1 => "🟡".to_string(),
-        _ => "🔴".to_string(),
-    };
+fn determine_status_icon(losses: u32) -> String {
+    ["🟢", "🟡", "🔴"][losses as usize].to_string()
+}
 
-    let mut total_loss_guard = total_loss.lock().await;
-    *total_loss_guard += losses;
-
-    let timestamp = Local::now().format("%d-%m-%Y %H:%M:%S").to_string();
-    let mut log_file = fs::OpenOptions::new().append(true).open(&log_filename).expect("Error abriendo log");
-    writeln!(log_file, "{},{},{},{},{},{},{},{}", timestamp, host, tipo, direccion, avg_ping, port.unwrap_or(0), losses, status_icon).expect("Error escribiendo en el log");
-
-    (host, tipo, direccion, avg_ping, port.unwrap_or(0).to_string(), losses.to_string(), status_icon)
+fn parse_ip_and_port(ip_str: &str, default_port: Option<u16>) -> (String, Option<u16>) {
+    ip_str.split_once(':').map_or(
+        (ip_str.to_string(), default_port.or(Some(443))),
+        |(ip, port)| (ip.to_string(), port.parse().ok()),
+    )
 }
 
 async fn resolve_hostname(hostname: &str) -> Option<IpAddr> {
@@ -150,11 +248,32 @@ async fn resolve_hostname(hostname: &str) -> Option<IpAddr> {
     None
 }
 
-fn parse_ip_and_port(ip_str: &str, default_port: Option<u16>) -> (String, Option<u16>) {
-    if let Some((ip, port)) = ip_str.split_once(':') {
-        if let Ok(port_num) = port.parse::<u16>() {
-            return (ip.to_string(), Some(port_num));
-        }
-    }
-    (ip_str.to_string(), default_port.or(Some(443)))
+fn log_ping_result(
+    log_filename: &str,
+    host: &str,
+    tipo: &str,
+    direccion: &str,
+    avg_ping: &str,
+    port: Option<u16>,
+    losses: u32,
+    status_icon: &str,
+) {
+    let timestamp = Local::now().format("%d-%m-%Y %H:%M:%S").to_string();
+    let mut log_file = fs::OpenOptions::new()
+        .append(true)
+        .open(log_filename)
+        .expect("Error abriendo log");
+    writeln!(
+        log_file,
+        "{},{},{},{},{},{},{},{}",
+        timestamp,
+        host,
+        tipo,
+        direccion,
+        avg_ping,
+        port.unwrap_or(0),
+        losses,
+        status_icon
+    )
+    .expect("Error escribiendo en el log");
 }
